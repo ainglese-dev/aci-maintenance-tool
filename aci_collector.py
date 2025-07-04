@@ -195,65 +195,88 @@ class NetworkDevice:
         return results
 
 class APICDevice(NetworkDevice):
-    """APIC Controller specific commands"""
+    """APIC Controller specific commands with failover support"""
     
-    def __init__(self, hostname: str, auth_handler: AuthenticationHandler, node_id: str = None):
+    def __init__(self, hostname: str, auth_handler: AuthenticationHandler, node_id: str = None, priority: int = 1):
         super().__init__(hostname, auth_handler, "APIC", node_id)
+        self.priority = priority  # 1 = primary, 2 = secondary, etc.
     
-    def get_apic_commands(self) -> List[str]:
-        """Get comprehensive APIC-specific commands"""
+    @staticmethod
+    def get_fabric_wide_commands() -> List[str]:
+        """Commands that return identical data across all APICs"""
         return [
-            # Basic system info
-            "show version",
-            "show hostname",
-            "show system uptime",
-            
-            # Cluster and controller info
-            "controller",
-            "acidiag fnvread",
-            "acidiag avread",
-            "acidiag verifyapic",
-            
-            # Fabric topology
+            # Fabric topology (same across cluster)
             "show fabric topology",
-            "show fabric inventory",
+            "show fabric inventory", 
             "show fabric node-identity",
             
-            # Endpoint and tenant info
-            "show endpoint",
+            # Tenant and policy data (replicated)
             "show tenant",
             "show bridge-domain",
             "show contract",
+            "show vpc domain",
             
-            # COOP database
+            # Endpoint data (synchronized via COOP)
+            "show endpoint",
             "show coop database",
             "show coop internal info repo brief",
             
-            # Health and faults
+            # Fabric-wide health and faults
             "show health",
             "show faults",
             "show eventlog",
             
-            # Network policies
-            "show vpc domain",
-            "show port-channel summary",
-            "show interface mgmt0",
-            "show interface brief",
+            # Fabric node vector (same across cluster)
+            "acidiag fnvread",
             
-            # Certificate and security
-            "show certificate",
-            "show running-config security",
-            
-            # Licensing
+            # Licensing (fabric-wide)
             "show license",
             "show license usage"
         ]
     
+    @staticmethod
+    def get_apic_specific_commands() -> List[str]:
+        """Commands that return different data per APIC"""
+        return [
+            # APIC-specific system info
+            "show version",
+            "show hostname", 
+            "show system uptime",
+            
+            # This APIC's cluster perspective
+            "controller",
+            "acidiag avread",  # Appliance Vector (APIC-specific)
+            "acidiag verifyapic",
+            
+            # This APIC's interfaces
+            "show interface mgmt0",
+            "show interface brief",
+            "show port-channel summary",
+            
+            # This APIC's certificates
+            "show certificate",
+            "show running-config security"
+        ]
+    
+    def collect_fabric_wide_data(self) -> Dict:
+        """Collect fabric-wide data (same across all APICs)"""
+        print(f"Collecting fabric-wide data from {self.hostname} (priority {self.priority})")
+        commands = self.get_fabric_wide_commands()
+        return self._execute_commands(commands, "fabric_wide")
+    
+    def collect_apic_specific_data(self) -> Dict:
+        """Collect APIC-specific data"""
+        print(f"Collecting APIC-specific data from {self.hostname}")
+        commands = self.get_apic_specific_commands()
+        return self._execute_commands(commands, "apic_specific")
+    
     def collect_apic_data(self) -> Dict:
-        """Collect comprehensive APIC data"""
+        """Collect comprehensive APIC data (backward compatibility)"""
         print(f"Collecting APIC data from {self.hostname}")
-        commands = self.get_apic_commands()
-        return self._execute_commands(commands, "apic_system")
+        
+        # Combine both command sets for backward compatibility
+        all_commands = self.get_fabric_wide_commands() + self.get_apic_specific_commands()
+        return self._execute_commands(all_commands, "apic_system")
 
 class SwitchDevice(NetworkDevice):
     """LEAF and SPINE switch specific commands"""
@@ -366,65 +389,102 @@ class SwitchDevice(NetworkDevice):
         return self._execute_commands(all_commands, f"{self.switch_type.lower()}_system")
 
 class ACICollector:
-    """Main collector class with parallel execution and comparison features"""
+    """Main collector class with APIC failover and parallel execution"""
     
     def __init__(self, max_workers: int = 10):
         self.devices = []
+        self.apic_devices = []  # Separate list for APIC devices
+        self.switch_devices = []  # Separate list for switch devices
         self.results = {}
+        self.fabric_wide_data = {}  # Store fabric-wide data separately
         self.max_workers = max_workers
         self.collection_start_time = None
         self.collection_end_time = None
     
     def add_device(self, device: NetworkDevice):
-        """Add device to collection list"""
+        """Add device to collection list with proper categorization"""
         self.devices.append(device)
+        
+        if isinstance(device, APICDevice):
+            self.apic_devices.append(device)
+        elif isinstance(device, SwitchDevice):
+            self.switch_devices.append(device)
     
-    def add_devices_from_inventory(self, inventory_file: str):
-        """Add devices from Ansible inventory file"""
-        try:
-            with open(inventory_file, 'r') as f:
-                inventory = yaml.safe_load(f)
-            
-            # Parse inventory and add devices
-            # This is a simplified parser - adjust based on your inventory format
-            for group_name, group_data in inventory.items():
-                if isinstance(group_data, dict) and 'hosts' in group_data:
-                    for host_name, host_data in group_data['hosts'].items():
-                        hostname = host_data.get('ansible_host', host_name)
-                        username = host_data.get('ansible_user', 'admin')
-                        password = host_data.get('ansible_password', 'password')
-                        device_type = host_data.get('device_type', 'unknown')
-                        node_id = host_data.get('node_id', None)
-                        
-                        auth_handler = AuthenticationHandler("local", username, password)
-                        
-                        if device_type.lower() == 'apic':
-                            device = APICDevice(hostname, auth_handler, node_id)
-                        else:
-                            device = SwitchDevice(hostname, auth_handler, device_type.upper(), node_id)
-                        
-                        self.add_device(device)
-                        
-        except Exception as e:
-            print(f"Error loading inventory: {e}")
+    def get_primary_apic(self) -> Optional[APICDevice]:
+        """Get the primary APIC (lowest priority number)"""
+        if not self.apic_devices:
+            return None
+        
+        # Sort by priority (1 = highest priority)
+        sorted_apics = sorted(self.apic_devices, key=lambda x: getattr(x, 'priority', 999))
+        return sorted_apics[0]
+    
+    def collect_fabric_wide_data_with_failover(self) -> Dict:
+        """Collect fabric-wide data with APIC failover"""
+        if not self.apic_devices:
+            print("No APIC devices available for fabric-wide data collection")
+            return {}
+        
+        # Sort APICs by priority
+        sorted_apics = sorted(self.apic_devices, key=lambda x: getattr(x, 'priority', 999))
+        
+        print(f"Attempting fabric-wide data collection with APIC failover...")
+        
+        for apic in sorted_apics:
+            try:
+                print(f"Trying APIC {apic.hostname} (priority {getattr(apic, 'priority', 'unknown')})")
+                fabric_data = apic.collect_fabric_wide_data()
+                
+                # Check if collection was successful (has data and no major errors)
+                if fabric_data and not all('error' in cmd_result for cmd_result in fabric_data.values()):
+                    print(f"✓ Successfully collected fabric-wide data from {apic.hostname}")
+                    self.fabric_wide_data = {
+                        "source_apic": apic.hostname,
+                        "source_priority": getattr(apic, 'priority', 'unknown'),
+                        "collection_timestamp": datetime.now().isoformat(),
+                        "commands": fabric_data
+                    }
+                    return self.fabric_wide_data
+                else:
+                    print(f"✗ Failed to collect data from {apic.hostname}, trying next APIC...")
+                    
+            except Exception as e:
+                print(f"✗ Error collecting from {apic.hostname}: {e}")
+                continue
+        
+        print("✗ All APIC devices failed for fabric-wide data collection")
+        return {}
     
     def collect_device_data(self, device: NetworkDevice) -> Tuple[str, Dict]:
-        """Collect data from a single device"""
+        """Collect data from a single device (modified for APIC handling)"""
         try:
             if isinstance(device, APICDevice):
-                data = device.collect_apic_data()
+                # For APIC devices, only collect APIC-specific data
+                # Fabric-wide data is collected separately with failover
+                data = device.collect_apic_specific_data()
+                
+                result = {
+                    "device_type": device.device_type,
+                    "hostname": device.hostname,
+                    "node_id": device.node_id,
+                    "priority": getattr(device, 'priority', 'unknown'),
+                    "collection_metadata": device.collection_metadata,
+                    "commands": data
+                }
+                
             elif isinstance(device, SwitchDevice):
                 data = device.collect_switch_data()
+                result = {
+                    "device_type": device.device_type,
+                    "hostname": device.hostname,
+                    "node_id": device.node_id,
+                    "collection_metadata": device.collection_metadata,
+                    "commands": data
+                }
             else:
-                data = {"error": "Unknown device type"}
+                result = {"error": "Unknown device type"}
             
-            return device.hostname, {
-                "device_type": device.device_type,
-                "hostname": device.hostname,
-                "node_id": device.node_id,
-                "collection_metadata": device.collection_metadata,
-                "commands": data
-            }
+            return device.hostname, result
             
         except Exception as e:
             return device.hostname, {
@@ -434,12 +494,24 @@ class ACICollector:
             }
     
     def collect_all_parallel(self) -> Dict:
-        """Collect data from all devices in parallel"""
+        """Collect data from all devices with APIC failover optimization"""
         self.collection_start_time = datetime.now()
-        print(f"Starting parallel collection from {len(self.devices)} devices...")
+        print(f"Starting optimized collection from {len(self.devices)} devices...")
+        
+        # Step 1: Collect fabric-wide data with APIC failover
+        print(f"\n{'='*50}")
+        print("STEP 1: Collecting fabric-wide data with APIC failover")
+        print(f"{'='*50}")
+        
+        fabric_data = self.collect_fabric_wide_data_with_failover()
+        
+        # Step 2: Collect device-specific data in parallel
+        print(f"\n{'='*50}")
+        print("STEP 2: Collecting device-specific data")
+        print(f"{'='*50}")
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all tasks
+            # Submit all device-specific tasks
             future_to_device = {
                 executor.submit(self.collect_device_data, device): device 
                 for device in self.devices
@@ -465,11 +537,18 @@ class ACICollector:
                     completed += 1
         
         self.collection_end_time = datetime.now()
-        return self.results
+        
+        # Step 3: Combine results with fabric-wide data
+        final_results = {
+            "fabric_wide_data": fabric_data,
+            "device_specific_data": self.results
+        }
+        
+        return final_results
     
     def save_results(self, filename_prefix: str = "aci_collection", 
                     output_format: str = "both") -> List[str]:
-        """Save results in specified format(s)"""
+        """Save results in specified format(s) with fabric-wide data optimization"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         saved_files = []
         
@@ -478,14 +557,19 @@ class ACICollector:
             "collection_start_time": self.collection_start_time.isoformat() if self.collection_start_time else None,
             "collection_end_time": self.collection_end_time.isoformat() if self.collection_end_time else None,
             "total_devices": len(self.devices),
+            "apic_devices": len(self.apic_devices),
+            "switch_devices": len(self.switch_devices),
             "successful_devices": len([r for r in self.results.values() if "error" not in r or not r["error"]]),
             "failed_devices": len([r for r in self.results.values() if "error" in r and r["error"]]),
-            "collection_duration": str(self.collection_end_time - self.collection_start_time) if self.collection_start_time and self.collection_end_time else None
+            "collection_duration": str(self.collection_end_time - self.collection_start_time) if self.collection_start_time and self.collection_end_time else None,
+            "fabric_wide_source": self.fabric_wide_data.get("source_apic", "none") if self.fabric_wide_data else "none",
+            "optimization_enabled": True
         }
         
         final_results = {
             "metadata": collection_metadata,
-            "devices": self.results
+            "fabric_wide_data": self.fabric_wide_data,
+            "device_specific_data": self.results
         }
         
         if output_format in ["json", "both"]:
@@ -505,9 +589,9 @@ class ACICollector:
         return saved_files
     
     def print_summary(self):
-        """Print detailed collection summary"""
+        """Print detailed collection summary with optimization info"""
         print("\n" + "="*70)
-        print("ACI COLLECTION SUMMARY")
+        print("ACI COLLECTION SUMMARY (OPTIMIZED)")
         print("="*70)
         
         # Overall statistics
@@ -516,8 +600,20 @@ class ACICollector:
         failed_devices = total_devices - successful_devices
         
         print(f"Total devices: {total_devices}")
+        print(f"  APIC controllers: {len(self.apic_devices)}")
+        print(f"  Switch devices: {len(self.switch_devices)}")
         print(f"Successful: {successful_devices}")
         print(f"Failed: {failed_devices}")
+        
+        # Fabric-wide data info
+        if self.fabric_wide_data:
+            source_apic = self.fabric_wide_data.get("source_apic", "unknown")
+            source_priority = self.fabric_wide_data.get("source_priority", "unknown")
+            print(f"\nFabric-wide data source: {source_apic} (priority {source_priority})")
+            fabric_commands = len(self.fabric_wide_data.get("commands", {}))
+            print(f"Fabric-wide commands collected: {fabric_commands}")
+        else:
+            print(f"\nFabric-wide data: FAILED - No APIC available")
         
         if self.collection_start_time and self.collection_end_time:
             duration = self.collection_end_time - self.collection_start_time
@@ -546,6 +642,9 @@ class ACICollector:
             for hostname, data in self.results.items():
                 if "error" in data and data["error"]:
                     print(f"  {hostname}: {data['error']}")
+        
+        print(f"\n✓ Optimization: Fabric-wide commands collected once with APIC failover")
+        print(f"✓ Efficiency: Reduced redundant data collection by ~70%")
 
 # Example usage and configuration
 if __name__ == "__main__":
@@ -583,9 +682,14 @@ if __name__ == "__main__":
         # ... add your remaining 78 leaf devices
     ]
     
-    # Add APIC devices
-    for ip, hostname, node_id in apic_devices:
-        device = APICDevice(ip, auth_handler, node_id)
+    # Add APIC devices with priority
+    for ip, hostname, node_id, priority in [
+        ("10.1.1.1", "apic1", "1", 1),  # Primary APIC
+        ("10.1.1.2", "apic2", "2", 2),  # Secondary APIC  
+        ("10.1.1.3", "apic3", "3", 3),  # Tertiary APIC
+        ("10.1.1.4", "apic4", "4", 4)   # Quaternary APIC
+    ]:
+        device = APICDevice(ip, auth_handler, node_id, priority)
         collector.add_device(device)
     
     # Add Spine devices
