@@ -1,0 +1,4 @@
+paramiko>=2.7.0
+ansible>=4.0.0
+pyyaml>=5.4.0
+pyats[full]>=21.0.0

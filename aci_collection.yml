@@ -1,0 +1,320 @@
+---
+# Enhanced ACI Data Collection Playbook
+# Handles APIC, LEAF, and SPINE devices with proper command sets
+# Supports before/after maintenance window collections
+- name: Collect Comprehensive ACI Network Data
+  hosts: all
+  gather_facts: no
+  serial: 10  # Limit parallel execution to avoid overwhelming network
+  vars:
+    output_dir: "./aci_outputs"
+    maintenance_phase: "{{ phase | default('before') }}"  # before or after
+    timestamp: "{{ ansible_date_time.epoch }}"
+    
+  tasks:
+    - name: Create output directory structure
+      file:
+        path: "{{ output_dir }}/{{ maintenance_phase }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Set device-specific command lists
+      set_fact:
+        apic_commands:
+          - "show version"
+          - "show hostname"
+          - "show system uptime"
+          - "controller"
+          - "acidiag fnvread"
+          - "acidiag avread"
+          - "acidiag verifyapic"
+          - "show fabric topology"
+          - "show fabric inventory"
+          - "show fabric node-identity"
+          - "show endpoint"
+          - "show tenant"
+          - "show bridge-domain"
+          - "show contract"
+          - "show coop database"
+          - "show coop internal info repo brief"
+          - "show health"
+          - "show faults"
+          - "show eventlog"
+          - "show vpc domain"
+          - "show port-channel summary"
+          - "show interface mgmt0"
+          - "show interface brief"
+          - "show certificate"
+          - "show license"
+        
+        switch_basic_commands:
+          - "show version"
+          - "show hostname"
+          - "show system uptime"
+          - "show system resources"
+          - "show interface brief"
+          - "show interface status"
+          - "show interface description"
+          - "show vpc"
+          - "show vpc brief"
+          - "show vpc consistency-parameters"
+          - "show port-channel summary"
+          - "show vlan brief"
+          - "show vlan extended"
+          - "show ip route summary"
+          - "show ip route vrf all"
+          - "show ip interface brief"
+          - "show hardware"
+          - "show environment"
+          - "show processes cpu"
+          - "show processes memory"
+        
+        switch_endpoint_commands:
+          - "show endpoint"
+          - "show system internal epm endpoint summary"
+          - "show system internal epm endpoint detail"
+          - "show coop internal info repo brief"
+          - "show coop internal info repo ep summary"
+          - "show isis dteps vrf overlay-1"
+          - "show isis adjacency vrf overlay-1"
+          - "show tunnel interface brief"
+          - "show ip arp"
+          - "show mac address-table"
+          - "show mac address-table dynamic"
+          - "show nve peers"
+          - "show nve vni"
+          - "show nve interface"
+          - "show forwarding adjacency"
+          - "show forwarding route"
+        
+        switch_troubleshooting_commands:
+          - "vsh_lc -c 'show system internal eltmc info vlan brief'"
+          - "show system internal epm vlan all"
+          - "show system internal forwarding l2 l2table"
+          - "show system internal policy-mgr stats"
+          - "show system internal aclmgr rules"
+          - "show system internal sysmgr service-state"
+          - "show interface counters"
+          - "show interface counters errors"
+          - "show interface counters detailed"
+
+    - name: Execute APIC commands
+      block:
+        - name: Run APIC-specific commands
+          raw: "{{ item }}"
+          loop: "{{ apic_commands }}"
+          register: apic_command_results
+          ignore_errors: yes
+          timeout: 60
+          
+        - name: Process APIC command results
+          set_fact:
+            processed_apic_results: "{{ processed_apic_results | default([]) + [{'command': item.item, 'output': item.stdout | default(''), 'error': item.stderr | default(''), 'success': not item.failed, 'timestamp': ansible_date_time.iso8601}] }}"
+          loop: "{{ apic_command_results.results }}"
+          loop_control:
+            loop_var: item
+          when: apic_command_results is defined
+      
+      when: device_type == "apic"
+
+    - name: Execute Switch commands (LEAF/SPINE)
+      block:
+        - name: Run basic switch commands
+          raw: "{{ item }}"
+          loop: "{{ switch_basic_commands }}"
+          register: switch_basic_results
+          ignore_errors: yes
+          timeout: 60
+          
+        - name: Run endpoint-related commands
+          raw: "{{ item }}"
+          loop: "{{ switch_endpoint_commands }}"
+          register: switch_endpoint_results
+          ignore_errors: yes
+          timeout: 60
+          
+        - name: Run troubleshooting commands
+          raw: "{{ item }}"
+          loop: "{{ switch_troubleshooting_commands }}"
+          register: switch_troubleshooting_results
+          ignore_errors: yes
+          timeout: 60
+          
+        - name: Process switch command results
+          set_fact:
+            processed_switch_results: "{{ processed_switch_results | default([]) + [{'command': item.item, 'output': item.stdout | default(''), 'error': item.stderr | default(''), 'success': not item.failed, 'timestamp': ansible_date_time.iso8601, 'category': category}] }}"
+          loop: "{{ switch_basic_results.results + switch_endpoint_results.results + switch_troubleshooting_results.results }}"
+          loop_control:
+            loop_var: item
+          vars:
+            category: "{{ 'basic' if item in switch_basic_results.results else ('endpoint' if item in switch_endpoint_results.results else 'troubleshooting') }}"
+      
+      when: device_type in ["leaf", "spine"]
+
+    - name: Create comprehensive JSON output
+      copy:
+        content: |
+          {
+            "metadata": {
+              "device": "{{ inventory_hostname }}",
+              "device_type": "{{ device_type }}",
+              "node_id": "{{ node_id | default('unknown') }}",
+              "maintenance_phase": "{{ maintenance_phase }}",
+              "collection_timestamp": "{{ ansible_date_time.iso8601 }}",
+              "collection_epoch": {{ ansible_date_time.epoch }},
+              "ansible_host": "{{ ansible_host }}",
+              "total_commands": {{ (processed_apic_results | default([]) | length) + (processed_switch_results | default([]) | length) }},
+              "successful_commands": {{ (processed_apic_results | default([]) | selectattr('success', 'equalto', true) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', true) | list | length) }},
+              "failed_commands": {{ (processed_apic_results | default([]) | selectattr('success', 'equalto', false) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', false) | list | length) }}
+            },
+            "commands": {
+              {% if device_type == "apic" %}
+              "apic_commands": {{ processed_apic_results | default([]) | to_json }}
+              {% else %}
+              "switch_commands": {{ processed_switch_results | default([]) | to_json }}
+              {% endif %}
+            }
+          }
+        dest: "{{ output_dir }}/{{ maintenance_phase }}/{{ inventory_hostname }}_{{ device_type }}_{{ maintenance_phase }}_{{ timestamp }}.json"
+      delegate_to: localhost
+
+    - name: Create human-readable text output
+      copy:
+        content: |
+          ================================================================
+          ACI DEVICE COLLECTION REPORT
+          ================================================================
+          Device: {{ inventory_hostname }}
+          Type: {{ device_type | upper }}
+          Node ID: {{ node_id | default('unknown') }}
+          Maintenance Phase: {{ maintenance_phase | upper }}
+          Collection Time: {{ ansible_date_time.iso8601 }}
+          ================================================================
+          
+          {% if device_type == "apic" %}
+          {% for result in processed_apic_results | default([]) %}
+          
+          Command: {{ result.command }}
+          Status: {{ 'SUCCESS' if result.success else 'FAILED' }}
+          Timestamp: {{ result.timestamp }}
+          {% if result.error %}
+          Error: {{ result.error }}
+          {% endif %}
+          
+          Output:
+          {{ result.output }}
+          
+          ================================================================
+          {% endfor %}
+          {% else %}
+          {% for result in processed_switch_results | default([]) %}
+          
+          Command: {{ result.command }}
+          Category: {{ result.category | upper }}
+          Status: {{ 'SUCCESS' if result.success else 'FAILED' }}
+          Timestamp: {{ result.timestamp }}
+          {% if result.error %}
+          Error: {{ result.error }}
+          {% endif %}
+          
+          Output:
+          {{ result.output }}
+          
+          ================================================================
+          {% endfor %}
+          {% endif %}
+        dest: "{{ output_dir }}/{{ maintenance_phase }}/{{ inventory_hostname }}_{{ device_type }}_{{ maintenance_phase }}_{{ timestamp }}.txt"
+      delegate_to: localhost
+
+    - name: Create device summary
+      copy:
+        content: |
+          {
+            "device_summary": {
+              "hostname": "{{ inventory_hostname }}",
+              "device_type": "{{ device_type }}",
+              "node_id": "{{ node_id | default('unknown') }}",
+              "maintenance_phase": "{{ maintenance_phase }}",
+              "collection_timestamp": "{{ ansible_date_time.iso8601 }}",
+              "total_commands": {{ (processed_apic_results | default([]) | length) + (processed_switch_results | default([]) | length) }},
+              "successful_commands": {{ (processed_apic_results | default([]) | selectattr('success', 'equalto', true) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', true) | list | length) }},
+              "failed_commands": {{ (processed_apic_results | default([]) | selectattr('success', 'equalto', false) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', false) | list | length) }},
+              "collection_status": "{{ 'SUCCESS' if ((processed_apic_results | default([]) | selectattr('success', 'equalto', false) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', false) | list | length)) == 0 else 'PARTIAL' }}",
+              "files_created": [
+                "{{ inventory_hostname }}_{{ device_type }}_{{ maintenance_phase }}_{{ timestamp }}.json",
+                "{{ inventory_hostname }}_{{ device_type }}_{{ maintenance_phase }}_{{ timestamp }}.txt"
+              ]
+            }
+          }
+        dest: "{{ output_dir }}/{{ maintenance_phase }}/{{ inventory_hostname }}_summary.json"
+      delegate_to: localhost
+
+    - name: Display collection results
+      debug:
+        msg: |
+          Collection completed for {{ inventory_hostname }} ({{ device_type | upper }})
+          Total commands: {{ (processed_apic_results | default([]) | length) + (processed_switch_results | default([]) | length) }}
+          Successful: {{ (processed_apic_results | default([]) | selectattr('success', 'equalto', true) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', true) | list | length) }}
+          Failed: {{ (processed_apic_results | default([]) | selectattr('success', 'equalto', false) | list | length) + (processed_switch_results | default([]) | selectattr('success', 'equalto', false) | list | length) }}
+          Files saved to: {{ output_dir }}/{{ maintenance_phase }}/
+
+# Post-collection summary task
+- name: Generate overall collection summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Find all summary files
+      find:
+        paths: "{{ output_dir }}/{{ maintenance_phase }}"
+        patterns: "*_summary.json"
+      register: summary_files
+
+    - name: Read all summary files
+      slurp:
+        src: "{{ item.path }}"
+      register: summary_contents
+      loop: "{{ summary_files.files }}"
+
+    - name: Create overall collection report
+      copy:
+        content: |
+          {
+            "collection_metadata": {
+              "maintenance_phase": "{{ maintenance_phase }}",
+              "collection_date": "{{ ansible_date_time.iso8601 }}",
+              "total_devices": {{ summary_contents.results | length }},
+              "successful_devices": {{ summary_contents.results | selectattr('content', 'search', '"collection_status": "SUCCESS"') | list | length }},
+              "partial_devices": {{ summary_contents.results | selectattr('content', 'search', '"collection_status": "PARTIAL"') | list | length }},
+              "device_breakdown": {
+                "apic": {{ summary_contents.results | selectattr('content', 'search', '"device_type": "apic"') | list | length }},
+                "leaf": {{ summary_contents.results | selectattr('content', 'search', '"device_type": "leaf"') | list | length }},
+                "spine": {{ summary_contents.results | selectattr('content', 'search', '"device_type": "spine"') | list | length }}
+              }
+            },
+            "device_summaries": [
+              {% for result in summary_contents.results %}
+              {{ result.content | b64decode | from_json }}{% if not loop.last %},{% endif %}
+              {% endfor %}
+            ]
+          }
+        dest: "{{ output_dir }}/{{ maintenance_phase }}/overall_collection_summary_{{ ansible_date_time.epoch }}.json"
+
+    - name: Display overall collection summary
+      debug:
+        msg: |
+          ================================================================
+          OVERALL ACI COLLECTION SUMMARY - {{ maintenance_phase | upper }}
+          ================================================================
+          Total devices processed: {{ summary_contents.results | length }}
+          Successful collections: {{ summary_contents.results | selectattr('content', 'search', '"collection_status": "SUCCESS"') | list | length }}
+          Partial collections: {{ summary_contents.results | selectattr('content', 'search', '"collection_status": "PARTIAL"') | list | length }}
+          
+          Device breakdown:
+          - APIC controllers: {{ summary_contents.results | selectattr('content', 'search', '"device_type": "apic"') | list | length }}
+          - LEAF switches: {{ summary_contents.results | selectattr('content', 'search', '"device_type": "leaf"') | list | length }}
+          - SPINE switches: {{ summary_contents.results | selectattr('content', 'search', '"device_type": "spine"') | list | length }}
+          
+          Collection files saved to: {{ output_dir }}/{{ maintenance_phase }}/
+          ================================================================

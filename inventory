@@ -1,0 +1,74 @@
+# Enhanced ACI Inventory File
+# Supports TACACS and local authentication
+# Includes node IDs for proper device identification
+
+[apic]
+apic1 ansible_host=10.1.1.1 device_type=apic node_id=1
+apic2 ansible_host=10.1.1.2 device_type=apic node_id=2
+apic3 ansible_host=10.1.1.3 device_type=apic node_id=3
+apic4 ansible_host=10.1.1.4 device_type=apic node_id=4
+
+[spine]
+spine1 ansible_host=10.1.1.10 device_type=spine node_id=101
+spine2 ansible_host=10.1.1.11 device_type=spine node_id=102
+spine3 ansible_host=10.1.1.12 device_type=spine node_id=103
+spine4 ansible_host=10.1.1.13 device_type=spine node_id=104
+
+[leaf]
+# Example leaf devices - add your remaining 76 leafs
+leaf1 ansible_host=10.1.1.20 device_type=leaf node_id=201
+leaf2 ansible_host=10.1.1.21 device_type=leaf node_id=202
+leaf3 ansible_host=10.1.1.22 device_type=leaf node_id=203
+leaf4 ansible_host=10.1.1.23 device_type=leaf node_id=204
+# ... continue adding leaf switches up to leaf80
+# leaf80 ansible_host=10.1.1.99 device_type=leaf node_id=280
+
+[aci:children]
+apic
+spine
+leaf
+
+# Global variables for all ACI devices
+[aci:vars]
+ansible_connection=ssh
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+ansible_python_interpreter=/usr/bin/python3
+ansible_timeout=60
+ansible_command_timeout=60
+
+# Authentication options - choose one method below
+
+# METHOD 1: Local Authentication (default)
+ansible_user=admin
+ansible_password=your_local_password
+
+# METHOD 2: TACACS Authentication (comment out local auth above and uncomment below)
+# ansible_user=domain\\tacacs_username
+# ansible_password=your_tacacs_password
+
+# METHOD 3: SSH Key Authentication (comment out password auth and uncomment below)
+# ansible_user=admin
+# ansible_ssh_private_key_file=~/.ssh/aci_key
+# ansible_ssh_pass=your_key_passphrase
+
+# Alternative authentication per device group
+# Uncomment and modify if different groups use different authentication
+
+# [apic:vars]
+# ansible_user=apic_admin
+# ansible_password=apic_specific_password
+
+# [spine:vars]
+# ansible_user=spine_admin
+# ansible_password=spine_specific_password
+
+# [leaf:vars]
+# ansible_user=leaf_admin
+# ansible_password=leaf_specific_password
+
+# Performance tuning for large deployments
+[all:vars]
+ansible_ssh_pipelining=true
+ansible_ssh_retries=3
+ansible_connect_timeout=30
+ansible_command_timeout=60
