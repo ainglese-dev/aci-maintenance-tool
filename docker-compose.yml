@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  aci-tool:
+    build: .
+    container_name: aci-maintenance-tool
+    hostname: aci-tool
+    
+    # Keep container running for customer interaction
+    command: sleep infinity
+    
+    volumes:
+      # Mount customer configuration
+      - ./customer-config:/aci-tool/customer-config
+      # Persist outputs and reports
+      - ./aci_outputs:/aci-tool/aci_outputs
+      - ./comparison_reports:/aci-tool/comparison_reports
+      # Optional: Customer SSH keys directory
+      - ./ssh-keys:/home/customer/.ssh:ro
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TERM=xterm-256color
+    
+    # Network access for ACI fabric connectivity
+    network_mode: "host"
+    
+    # Interactive mode for VSCode
+    stdin_open: true
+    tty: true
+    
+    # Restart policy for production use
+    restart: unless-stopped
